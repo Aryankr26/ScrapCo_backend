@@ -13,11 +13,13 @@
 
 const express = require('express');
 
-const { createAnonClientWithJwt, createServiceClient } = require('../supabase/client');
+const { createAnonClientWithJwt } = require('../supabase/client');
 const { getBearerToken } = require('../supabase/auth');
-const { ensureDevProfile, isDevBypassAllowed, pickOrCreateDevCustomerId } = require('../supabase/devBypass');
 
 const router = express.Router();
+
+// Dispatch service: responsible for finding vendors and sending offers
+const dispatcher = require('../services/dispatcher');
 
 /**
  * Helper: Validate the incoming request body.
@@ -45,59 +47,6 @@ function validatePickupBody(body) {
 
   return null;
 }
-
-/**
- * GET /api/pickups
- * Returns all pickup requests.
- */
-router.get('/', async (req, res) => {
-  try {
-    const jwt = getBearerToken(req);
-    if (!jwt) return res.status(401).json({ success: false, error: 'Missing Authorization Bearer token' });
-
-    let supabase;
-    try {
-      supabase = createAnonClientWithJwt(jwt);
-    } catch (e) {
-      return res.status(500).json({ success: false, error: e?.message || 'Supabase is not configured on server' });
-    }
-
-    // RLS should ensure customer only sees their rows.
-    const { data, error } = await supabase
-      .from('pickups')
-      .select(
-        'id,status,address,latitude,longitude,time_slot,assigned_vendor_ref,assignment_expires_at,cancelled_at,created_at,' +
-          'pickup_items(id,estimated_quantity,scrap_type_id,scrap_types(name))'
-      )
-      .order('created_at', { ascending: false });
-
-    if (error) return res.status(400).json({ success: false, error: error.message });
-
-    const pickups = (data || []).map((p) => ({
-      id: p.id,
-      status: p.status,
-      address: p.address,
-      latitude: p.latitude,
-      longitude: p.longitude,
-      timeSlot: p.time_slot,
-      assignedVendorRef: p.assigned_vendor_ref,
-      assignmentExpiresAt: p.assignment_expires_at,
-      cancelledAt: p.cancelled_at,
-      createdAt: p.created_at,
-      items: (p.pickup_items || []).map((it) => ({
-        id: it.id,
-        scrapTypeId: it.scrap_type_id,
-        scrapTypeName: it.scrap_types?.name || null,
-        estimatedQuantity: it.estimated_quantity,
-      })),
-    }));
-
-    res.json({ success: true, count: pickups.length, pickups });
-  } catch (err) {
-    console.error('Error fetching pickups:', err);
-    res.status(500).json({ success: false, error: 'Could not fetch pickups' });
-  }
-});
 
 /**
  * POST /api/pickups
@@ -148,7 +97,21 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ success: false, error: msg });
     }
 
-    return res.status(201).json({ success: true, pickup: data });
+    // RPC returns pickupId (uuid)
+    const pickupId = data;
+
+    console.log(`[DISPATCH] pickup_created pickupId=${pickupId}`);
+
+    // Kick off dispatch in background (do not block response)
+    try {
+      if (pickupId) {
+        dispatcher.dispatchPickup(pickupId).catch((e) => console.warn('[DISPATCH] dispatch_error', e));
+      }
+    } catch (e) {
+      console.warn('[DISPATCH] dispatch_schedule_failed', e);
+    }
+
+    return res.status(201).json({ success: true, pickupId });
   } catch (err) {
     console.error('Error creating pickup:', err);
     return res.status(500).json({ success: false, error: 'Could not create pickup' });
@@ -156,82 +119,93 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * POST /api/pickups/dev
- * Dev-only: inserts a pickup using the service role (bypasses RLS).
- * Useful when the mobile app auth is temporarily bypassed.
+ * GET /api/pickups/:id
+ * Fetch a single pickup (status tracking)
  */
-router.post('/dev', async (req, res) => {
-  if (!isDevBypassAllowed()) {
-    return res.status(403).json({
-      success: false,
-      error: 'Dev bypass is disabled on server. Set ALLOW_DEV_BYPASS=true to enable /api/pickups/dev.',
-    });
-  }
-
-  const errorMessage = validatePickupBody(req.body);
-  if (errorMessage) {
-    return res.status(400).json({ success: false, error: errorMessage });
-  }
-
+router.get('/:id', async (req, res) => {
   try {
+    const jwt = getBearerToken(req);
+    if (!jwt) return res.status(401).json({ success: false, error: 'Missing Authorization Bearer token' });
+
     let supabase;
     try {
-      supabase = createServiceClient();
+      supabase = createAnonClientWithJwt(jwt);
     } catch (e) {
       return res.status(500).json({ success: false, error: e?.message || 'Supabase is not configured on server' });
     }
 
-    let devCustomerId;
-    try {
-      devCustomerId = await pickOrCreateDevCustomerId(supabase);
-    } catch (e) {
-      return res.status(400).json({ success: false, error: e?.message || 'Could not select a dev customer.' });
-    }
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ success: false, error: 'id is required' });
 
-    try {
-      await ensureDevProfile(supabase, devCustomerId);
-    } catch (e) {
-      return res.status(400).json({
-        success: false,
-        error: e?.message || 'Could not ensure profile exists. Set DEV_CUSTOMER_ID to a valid auth.users id in backend/.env.',
-      });
-    }
-
-    const pickupRow = {
-      customer_id: devCustomerId,
-      address: String(req.body.address).trim(),
-      latitude: req.body.latitude ?? null,
-      longitude: req.body.longitude ?? null,
-      time_slot: String(req.body.timeSlot).trim(),
-    };
-
-    const { data: pickup, error: pickupErr } = await supabase
+    const { data, error } = await supabase
       .from('pickups')
-      .insert([pickupRow])
-      .select('id')
-      .single();
+      .select(
+        'id,status,address,latitude,longitude,time_slot,assigned_vendor_ref,assignment_expires_at,cancelled_at,completed_at,created_at,' +
+          'pickup_items(id,estimated_quantity,scrap_type_id,scrap_types(name))'
+      )
+      .eq('id', id)
+      .maybeSingle();
 
-    if (pickupErr) {
-      return res.status(400).json({ success: false, error: pickupErr.message || 'Could not insert pickup' });
-    }
+    if (error) return res.status(400).json({ success: false, error: error.message });
+    if (!data) return res.status(404).json({ success: false, error: 'pickup not found' });
 
-    const pickupId = pickup.id;
-    const itemRows = req.body.items.map((it) => ({
-      pickup_id: pickupId,
-      scrap_type_id: it.scrapTypeId,
-      estimated_quantity: it.estimatedQuantity,
-    }));
-
-    const { error: itemsErr } = await supabase.from('pickup_items').insert(itemRows);
-    if (itemsErr) {
-      return res.status(400).json({ success: false, error: itemsErr.message });
-    }
-
-    return res.status(201).json({ success: true, pickupId });
+    return res.json({
+      success: true,
+      pickup: {
+        id: data.id,
+        status: data.status,
+        address: data.address,
+        latitude: data.latitude,
+        longitude: data.longitude,
+        timeSlot: data.time_slot,
+        assignedVendorRef: data.assigned_vendor_ref,
+        assignmentExpiresAt: data.assignment_expires_at,
+        cancelledAt: data.cancelled_at,
+        completedAt: data.completed_at,
+        createdAt: data.created_at,
+        items: (data.pickup_items || []).map((it) => ({
+          id: it.id,
+          scrapTypeId: it.scrap_type_id,
+          scrapTypeName: it.scrap_types?.name || null,
+          estimatedQuantity: it.estimated_quantity,
+        })),
+      },
+    });
   } catch (err) {
-    console.error('Error creating pickup (dev):', err);
-    return res.status(500).json({ success: false, error: 'Could not create pickup (dev)' });
+    console.error('Error fetching pickup:', err);
+    return res.status(500).json({ success: false, error: 'Could not fetch pickup' });
   }
 });
 
+// After create we attempt dispatching (non-blocking)
+// Note: the RPC above returns the `pickup` row; callers that use this
+// route will receive the created pickup immediately while dispatch runs
+// in the background.
+
+
 module.exports = router;
+
+/**
+ * POST /api/pickups/accepted
+ * Optional vendor notification endpoint: vendor can POST here to notify the customer backend
+ * that it has accepted and notified its user. This will attempt to confirm acceptance via dispatcher.
+ */
+router.post('/accepted', async (req, res) => {
+  // vendor should sign this request using same signature scheme
+  const { verifyVendorSignature } = require('../vendor/security');
+  const sig = verifyVendorSignature(req);
+  if (!sig.ok) return res.status(401).json({ success: false, error: sig.error });
+
+  const { pickupId, assignedVendorRef } = req.body || {};
+  if (!pickupId) return res.status(400).json({ success: false, error: 'pickupId is required' });
+
+  try {
+    const dispatcher = require('../services/dispatcher');
+    const result = await dispatcher.confirmVendorAcceptance(pickupId, assignedVendorRef);
+    if (!result) return res.status(409).json({ success: false, error: 'Could not confirm acceptance' });
+    return res.json({ success: true, pickup: result });
+  } catch (e) {
+    console.error('Pickup accepted notify failed', e);
+    return res.status(500).json({ success: false, error: 'Pickup accepted notify failed' });
+  }
+});

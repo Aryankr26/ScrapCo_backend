@@ -27,7 +27,14 @@ async function initDb() {
     -- pickup status enum
     DO $$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'pickup_status') THEN
-        CREATE TYPE pickup_status AS ENUM ('REQUESTED','ASSIGNED','ACCEPTED','PICKED','COMPLETED','CANCELLED');
+        CREATE TYPE pickup_status AS ENUM (
+          'REQUESTED',
+          'FINDING_VENDOR',
+          'ASSIGNED',
+          'COMPLETED',
+          'NO_VENDOR_AVAILABLE',
+          'CANCELLED'
+        );
       END IF;
     END$$;
 

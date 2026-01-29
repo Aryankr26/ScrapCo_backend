@@ -19,15 +19,17 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
-// Routers
+const dispatcher = require('./services/dispatcher');
+
+// Routers (EXPOSE ONLY the minimal dispatcher API surface)
 const pickupsRouter = require('./routes/pickups');
-const scrapTypesRouter = require('./routes/scrapTypes');
 const vendorRouter = require('./routes/vendor');
-const ordersRouter = require('./routes/orders');
-const adminRouter = require('./routes/admin');
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+
+// Start background dispatcher tasks (expiry enforcement)
+dispatcher.startDispatcherSweeper();
 
 // -----------------------------
 // MIDDLEWARE
@@ -54,26 +56,11 @@ app.use((req, res, next) => {
 // ROUTES
 // -----------------------------
 
-// 1) Health check
-app.get('/', (req, res) => {
-  res.send('ScrapCo backend running');
-});
-
-// 2) Pickup routes
-// Mounts all routes from pickupsRouter under /api/pickups
+// 1) Pickup routes
 app.use('/api/pickups', pickupsRouter);
 
-// 3) Scrap types
-app.use('/api/scrap-types', scrapTypesRouter);
-
-// 4) Vendor callback routes (protected)
+// 2) Vendor callback routes (protected)
 app.use('/api/vendor', vendorRouter);
-
-// 5) Orders (dev-bypass list/details)
-app.use('/api/orders', ordersRouter);
-
-// 6) Admin portal (no-auth, server-enabled)
-app.use('/api/admin', adminRouter);
 
 // -----------------------------
 // ERROR HANDLING
