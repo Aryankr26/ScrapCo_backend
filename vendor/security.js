@@ -12,6 +12,10 @@ function hmacSha256Hex(secret, rawBody) {
 }
 
 function verifyVendorSignature(req) {
+  // ✅ DEV / LOCAL BYPASS
+  
+
+  // 🔐 PRODUCTION MODE
   const secret = process.env.VENDOR_WEBHOOK_SECRET;
   if (!secret) return { ok: false, error: 'VENDOR_WEBHOOK_SECRET is not configured' };
 

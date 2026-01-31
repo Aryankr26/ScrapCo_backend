@@ -9,6 +9,12 @@ let sweeperTimer = null;
 function statusFindingVendor() { return 'FINDING_VENDOR'; }
 function statusAssigned() { return 'ASSIGNED'; }
 function statusNoVendorAvailable() { return 'NO_VENDOR_AVAILABLE'; }
+function statusCancelled() { return 'CANCELLED'; }
+function statusCompleted() { return 'COMPLETED'; }
+
+function isTerminalStatus(status) {
+  return status === statusAssigned() || status === statusCancelled() || status === statusCompleted();
+}
 
 function vendorIdOf(v) {
   return v?.vendor_id || v?.vendor_ref || v?.id || 'unknown';
@@ -21,7 +27,52 @@ function isVendorAvailable(v) {
 }
 
 function offerUrlOf(v) {
-  return v?.offer_url || v?.endpoint || v?.endpoint_offer_url || null;
+  const raw = v?.offer_url || v?.endpoint || v?.endpoint_offer_url || null;
+  if (!raw) return null;
+
+  // Vendor Backend expects offers at POST /api/offer (SSE fanout happens there).
+  // If the stored URL is already the full offer endpoint, keep it.
+  // Otherwise, treat it as a base URL and force the /api/offer path.
+  try {
+    const u = new URL(raw);
+    const normalizedPath = String(u.pathname || '').replace(/\/+$/, '');
+    if (normalizedPath === '/api/offer') return u.toString();
+    u.pathname = '/api/offer';
+    u.search = '';
+    u.hash = '';
+    return u.toString();
+  } catch {
+    // Fall back to raw (validation will likely reject it if malformed)
+    return raw;
+  }
+}
+
+async function fetchScrapSummary(supabase, pickupId) {
+  // Optional enrichment: build a human-readable summary for the vendor UI.
+  try {
+    const { data, error } = await supabase
+      .from('pickups')
+      .select('id,pickup_items(estimated_quantity,scrap_type_id,scrap_types(name))')
+      .eq('id', pickupId)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    const items = data.pickup_items || [];
+    if (!Array.isArray(items) || items.length === 0) return null;
+
+    const parts = items
+      .map((it) => {
+        const name = it?.scrap_types?.name || it?.scrap_type_id || 'Unknown';
+        const qty = it?.estimated_quantity;
+        if (qty == null || qty === '') return String(name);
+        return `${name}: ${qty}`;
+      })
+      .filter(Boolean);
+
+    return parts.length ? parts.join(', ') : null;
+  } catch {
+    return null;
+  }
 }
 
 function validateOfferUrl(url) {
@@ -45,6 +96,44 @@ function nowIso() {
 
 function plusMinutesIso(minutes) {
   return new Date(Date.now() + minutes * 60 * 1000).toISOString();
+}
+
+async function fetchRejectedVendorRefs(supabase, pickupId) {
+  // Optional persistence: if the table doesn't exist yet, treat as none.
+  try {
+    const { data, error } = await supabase
+      .from('pickup_vendor_rejections')
+      .select('vendor_ref')
+      .eq('pickup_id', pickupId)
+      .limit(500);
+
+    if (error) {
+      if (/relation .*pickup_vendor_rejections.* does not exist/i.test(error.message || '')) return new Set();
+      console.warn('[DISPATCH] rejected_vendor_query_failed', error.message || error);
+      return new Set();
+    }
+
+    return new Set((data || []).map((r) => String(r.vendor_ref)));
+  } catch (e) {
+    return new Set();
+  }
+}
+
+async function recordVendorRejection(supabase, pickupId, vendorRef) {
+  // Best-effort persistence: if the table doesn't exist yet, do not fail the request.
+  try {
+    const { error } = await supabase
+      .from('pickup_vendor_rejections')
+      .upsert([{ pickup_id: pickupId, vendor_ref: String(vendorRef), rejected_at: nowIso() }], {
+        onConflict: 'pickup_id,vendor_ref',
+      });
+
+    if (error && !/relation .*pickup_vendor_rejections.* does not exist/i.test(error.message || '')) {
+      console.warn('[DISPATCH] rejected_vendor_record_failed', error.message || error);
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function haversineDistanceKm(lat1, lon1, lat2, lon2) {
@@ -91,45 +180,52 @@ async function fetchVendors(supabase) {
   return list;
 }
 
-async function sendOfferToVendor(vendor, pickup) {
+async function sendOfferToVendor(supabase, vendor, pickup) {
   const url = offerUrlOf(vendor);
   const vendorId = vendorIdOf(vendor);
 
   const urlCheck = validateOfferUrl(url);
   if (!urlCheck.ok) {
+  // Allow localhost during local development
+  if (process.env.NODE_ENV !== 'production' && String(url).includes('localhost')) {
+    console.warn(
+      `[DISPATCH] offer_url_localhost_allowed pickupId=${pickup.id} vendor_id=${vendorId} offer_url=${String(url)}`
+    );
+  } else {
     console.warn(
       `[DISPATCH] offer_url_invalid pickupId=${pickup.id} vendor_id=${vendorId} offer_url=${String(url)} reason=${urlCheck.reason}`
     );
     throw new Error(`Invalid offer_url for vendor ${vendorId}: ${urlCheck.reason}`);
   }
+}
+
 
   console.log(`[DISPATCH] offer_url_used pickupId=${pickup.id} vendor_id=${vendorId} offer_url=${url}`);
 
   const requestId = String(pickup.id);
 
+  const latitude = Number(pickup.latitude ?? pickup.lat ?? null);
+  const longitude = Number(pickup.longitude ?? pickup.lon ?? pickup.lng ?? null);
+
+  const scrapSummary = await fetchScrapSummary(supabase, pickup.id);
+
   const body = {
-    // Vendor backend commonly expects these exact fields
+    // Vendor backend SSE system expects these exact fields
     vendor_id: vendorId,
     request_id: requestId,
+    // Back-compat / convenience: some vendor clients expect pickupId
+    pickupId: requestId,
+    pickup_id: requestId,
 
-    // Keep our richer payload for debugging / future compatibility
-    pickupId: pickup.id,
-    pickup: {
-      address: pickup.address,
-      latitude: pickup.latitude,
-      longitude: pickup.longitude,
-      timeSlot: pickup.time_slot || pickup.timeSlot,
-      items: pickup.items || [],
-    },
-    // Provide vendor the customer backend endpoints so vendor knows where to callback
-    customerBackend: {
-      acceptUrl: process.env.CUSTOMER_BACKEND_ACCEPT_URL || `${process.env.CUSTOMER_BACKEND_URL || ''}/api/vendor/accept`,
-      notifyUrl: process.env.CUSTOMER_BACKEND_NOTIFY_URL || `${process.env.CUSTOMER_BACKEND_URL || ''}/api/pickups/accepted`,
-      locationUrl: process.env.CUSTOMER_BACKEND_LOCATION_URL || `${process.env.CUSTOMER_BACKEND_URL || ''}/api/vendor/location`,
-    },
+    latitude: Number.isFinite(latitude) ? latitude : null,
+    longitude: Number.isFinite(longitude) ? longitude : null,
+
+    ...(scrapSummary ? { scrap_summary: scrapSummary } : {}),
   };
 
-  console.log(`[DISPATCH] offer_payload pickupId=${pickup.id} vendor_id=${vendorId} request_id=${requestId}`);
+  console.log(
+    `[DISPATCH] offer_payload pickupId=${pickup.id} vendor_id=${vendorId} request_id=${requestId} lat=${body.latitude} lon=${body.longitude} scrap=${scrapSummary ? 'yes' : 'no'}`
+  );
 
   const headers = { 'content-type': 'application/json' };
   if (process.env.VENDOR_API_TOKEN) headers['authorization'] = `Bearer ${process.env.VENDOR_API_TOKEN}`;
@@ -175,8 +271,31 @@ async function dispatchPickup(pickupId, options = {}) {
     return;
   }
 
-  // Set status to FINDING_VENDOR
-  await supabase.from('pickups').update({ status: statusFindingVendor() }).eq('id', pickupId);
+  // Do not attempt dispatch for terminal statuses
+  if (isTerminalStatus(pickup.status)) {
+    console.log(`[DISPATCH] dispatch_ignored_terminal pickupId=${pickupId} status=${pickup.status}`);
+    return;
+  }
+
+  // If an active (unexpired) offer is already out, avoid restarting dispatch.
+  if (
+    pickup.status === statusFindingVendor() &&
+    pickup.assigned_vendor_ref &&
+    pickup.assignment_expires_at &&
+    new Date(pickup.assignment_expires_at) > new Date()
+  ) {
+    console.log(
+      `[DISPATCH] dispatch_ignored_active_offer pickupId=${pickupId} vendor_ref=${pickup.assigned_vendor_ref} expiresAt=${pickup.assignment_expires_at}`
+    );
+    return;
+  }
+
+  // Set status to FINDING_VENDOR (but never clobber terminal states)
+  await supabase
+    .from('pickups')
+    .update({ status: statusFindingVendor() })
+    .eq('id', pickupId)
+    .in('status', ['REQUESTED', statusNoVendorAvailable(), statusFindingVendor()]);
   console.log(`[DISPATCH] status_change pickupId=${pickupId} status=${statusFindingVendor()}`);
 
   const vendors = await fetchVendors(supabase);
@@ -189,6 +308,8 @@ async function dispatchPickup(pickupId, options = {}) {
   console.log(`[DISPATCH] vendors_loaded pickupId=${pickupId} count=${vendors.length}`);
 
   const skipRefs = new Set((options.skipVendorRefs || []).map((x) => String(x)));
+  const persistedRejected = await fetchRejectedVendorRefs(supabase, pickupId);
+  for (const ref of persistedRejected) skipRefs.add(String(ref));
 
   // Compute distances
   const px = Number(pickup.latitude) || Number(pickup.lat) || null;
@@ -225,7 +346,7 @@ async function dispatchPickup(pickupId, options = {}) {
     if (prev.timer) clearTimeout(prev.timer);
   }
 
-  const state = { pickupId, candidates, index: 0, timer: null };
+  const state = { pickupId, candidates, index: 0, timer: null, rejectedVendorRefs: new Set() };
   dispatchState.set(pickupId, state);
 
   // try first candidate
@@ -237,9 +358,25 @@ async function tryOfferNext(pickupId) {
   const state = dispatchState.get(pickupId);
   if (!state) return;
 
+  async function clearExpiredOfferIfAny() {
+    const now = nowIso();
+    await supabase
+      .from('pickups')
+      .update({ assigned_vendor_ref: null, assignment_expires_at: null })
+      .eq('id', pickupId)
+      .eq('status', statusFindingVendor())
+      .not('assignment_expires_at', 'is', null)
+      .lt('assignment_expires_at', now);
+  }
+
   while (state.index < state.candidates.length) {
     const vendor = state.candidates[state.index];
     const vendorId = vendorIdOf(vendor);
+    if (state.rejectedVendorRefs && state.rejectedVendorRefs.has(String(vendorId))) {
+      console.log(`[DISPATCH] vendor_skipped_rejected pickupId=${pickupId} vendor_id=${vendorId}`);
+      state.index += 1;
+      continue;
+    }
     const offerUrl = offerUrlOf(vendor);
     console.log(
       `[DISPATCH] vendor_selected pickupId=${pickupId} index=${state.index + 1}/${state.candidates.length} vendor_id=${vendorId} is_available=${isVendorAvailable(
@@ -247,22 +384,58 @@ async function tryOfferNext(pickupId) {
       )} offer_url=${offerUrl || ''}`
     );
     try {
+      // Ensure we never overwrite an active (unexpired) offer.
+      await clearExpiredOfferIfAny();
+
       // set assigned vendor ref and assignment_expires_at
       const expiresAt = plusMinutesIso(2);
-      await supabase
+      const { data: offered, error: offerErr } = await supabase
         .from('pickups')
         .update({
           assigned_vendor_ref: vendorId,
           assignment_expires_at: expiresAt,
           status: statusFindingVendor(),
         })
-        .eq('id', pickupId);
+        .eq('id', pickupId)
+        .eq('status', statusFindingVendor())
+        .is('assigned_vendor_ref', null)
+        .select('id,status,assigned_vendor_ref,assignment_expires_at')
+        .maybeSingle();
+
+      if (offerErr) throw offerErr;
+      if (!offered) {
+        const currentPickup = await fetchPickup(supabase, pickupId);
+        if (!currentPickup) return;
+        if (isTerminalStatus(currentPickup.status)) {
+          console.log(`[DISPATCH] offer_aborted_terminal pickupId=${pickupId} status=${currentPickup.status}`);
+          if (state.timer) clearTimeout(state.timer);
+          dispatchState.delete(pickupId);
+          return;
+        }
+
+        // Another worker/timer may already have an active offer out.
+        if (
+          currentPickup.status === statusFindingVendor() &&
+          currentPickup.assigned_vendor_ref &&
+          currentPickup.assignment_expires_at &&
+          new Date(currentPickup.assignment_expires_at) > new Date()
+        ) {
+          console.log(
+            `[DISPATCH] offer_skipped_active_offer pickupId=${pickupId} vendor_ref=${currentPickup.assigned_vendor_ref} expiresAt=${currentPickup.assignment_expires_at}`
+          );
+          return;
+        }
+
+        // Otherwise, advance and keep trying.
+        state.index += 1;
+        continue;
+      }
 
       console.log(`[DISPATCH] offer_prepared pickupId=${pickupId} vendor_id=${vendorId} expiresAt=${expiresAt}`);
 
       // send offer
       const pickup = await fetchPickup(supabase, pickupId);
-      await sendOfferToVendor(vendor, pickup);
+      await sendOfferToVendor(supabase, vendor, pickup);
 
       // set timer to handle timeout
       if (state.timer) clearTimeout(state.timer);
@@ -303,8 +476,26 @@ async function handleOfferTimeout(pickupId, vendor) {
       return;
     }
 
+    // If pickup is cancelled/completed, stop dispatching
+    if (pickup.status === statusCancelled() || pickup.status === statusCompleted()) {
+      dispatchState.delete(pickupId);
+      return;
+    }
+
     // If assignment_expires_at is in the future, don't expire yet
     if (pickup.assignment_expires_at && new Date(pickup.assignment_expires_at) > new Date()) return;
+
+    // Clear the expired offer only if it still matches the vendor we offered.
+    const offeredVendorRef = vendorIdOf(vendor);
+    const now = nowIso();
+    await supabase
+      .from('pickups')
+      .update({ assigned_vendor_ref: null, assignment_expires_at: null })
+      .eq('id', pickupId)
+      .eq('status', statusFindingVendor())
+      .eq('assigned_vendor_ref', offeredVendorRef)
+      .not('assignment_expires_at', 'is', null)
+      .lt('assignment_expires_at', now);
 
     // Mark vendor as timed out (no history), move to next
     const state = dispatchState.get(pickupId);
@@ -332,10 +523,10 @@ async function confirmVendorAcceptance(pickupId, assignedVendorRef) {
   // Strict expiry enforcement: accept only if the offer has not expired.
   const now = nowIso();
 
-  // Transactionally ensure pickup assignedVendorRef matches and status is FINDING_VENDOR
+  // Atomic assignment: succeed only if this vendor is currently offered and unexpired.
   const { data, error } = await supabase
     .from('pickups')
-    .update({ status: statusAssigned() })
+    .update({ status: statusAssigned(), assigned_vendor_ref: assignedVendorRef, assignment_expires_at: null })
     .eq('id', pickupId)
     .eq('assigned_vendor_ref', assignedVendorRef)
     .eq('status', statusFindingVendor())
@@ -345,7 +536,7 @@ async function confirmVendorAcceptance(pickupId, assignedVendorRef) {
 
   if (error) throw error;
   if (!data) {
-    // Could be already assigned or expired
+    // Late accept / mismatched vendor / cancelled / already assigned.
     return null;
   }
 
@@ -397,16 +588,25 @@ module.exports = {
   confirmVendorAcceptance,
   handleVendorRejection: async function (pickupId, assignedVendorRef) {
     const supabase = createServiceClient();
-    const { data: pickup, error } = await supabase
+
+    // Record rejection (best-effort; does not block redispatch)
+    await recordVendorRejection(supabase, pickupId, assignedVendorRef);
+
+    // Atomically clear the assignment only if this vendor is currently offered.
+    const { data: cleared, error } = await supabase
       .from('pickups')
-      .select('id,status,assigned_vendor_ref,assignment_expires_at')
+      .update({ assigned_vendor_ref: null, assignment_expires_at: null, status: statusFindingVendor() })
       .eq('id', pickupId)
+      .eq('status', statusFindingVendor())
+      .eq('assigned_vendor_ref', assignedVendorRef)
+      .select('id,status,assigned_vendor_ref')
       .maybeSingle();
 
     if (error) throw error;
-    if (!pickup) return null;
-    if (pickup.status !== statusFindingVendor()) return null;
-    if (String(pickup.assigned_vendor_ref || '') !== String(assignedVendorRef || '')) return null;
+    if (!cleared) {
+      // Late reject or mismatched vendor; ignore.
+      return null;
+    }
 
     const state = dispatchState.get(pickupId);
     if (!state) {
@@ -415,9 +615,16 @@ module.exports = {
       return { restarted: true };
     }
 
+    if (state.rejectedVendorRefs) state.rejectedVendorRefs.add(String(assignedVendorRef));
+
     const current = state.candidates[state.index];
-    const curRef = current?.vendor_ref || current?.id;
-    if (String(curRef) !== String(assignedVendorRef || '')) return null;
+    const curRef = vendorIdOf(current);
+    if (String(curRef) !== String(assignedVendorRef || '')) {
+      // The rejecting vendor isn't the current candidate anymore (timeout/advance happened);
+      // still keep it rejected and continue dispatch if needed.
+      await tryOfferNext(pickupId);
+      return { advanced: true, outOfOrder: true };
+    }
 
     state.index += 1;
     if (state.timer) {
