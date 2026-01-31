@@ -13,7 +13,7 @@
 
 const express = require('express');
 
-const { createAnonClientWithJwt } = require('../supabase/client');
+const { createAnonClientWithJwt, createServiceClient } = require('../supabase/client');
 const { getBearerToken } = require('../supabase/auth');
 
 const router = express.Router();
@@ -177,13 +177,108 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// After create we attempt dispatching (non-blocking)
-// Note: the RPC above returns the `pickup` row; callers that use this
-// route will receive the created pickup immediately while dispatch runs
-// in the background.
+/**
+ * POST /api/pickups/:id/find-vendor
+ * Customer-initiated retry: clears any current offer and restarts dispatch.
+ * Dispatch decisions remain in the backend.
+ */
+router.post('/:id/find-vendor', async (req, res) => {
+  try {
+    const jwt = getBearerToken(req);
+    if (!jwt) return res.status(401).json({ success: false, error: 'Missing Authorization Bearer token' });
 
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ success: false, error: 'id is required' });
 
-module.exports = router;
+    const anon = createAnonClientWithJwt(jwt);
+    const { data: owned, error: ownErr } = await anon.from('pickups').select('id,status').eq('id', id).maybeSingle();
+    if (ownErr) return res.status(400).json({ success: false, error: ownErr.message || 'Could not verify pickup' });
+    if (!owned) return res.status(404).json({ success: false, error: 'pickup not found' });
+
+    const status = String(owned.status || '').toUpperCase();
+    if (status === 'ASSIGNED' || status === 'CANCELLED' || status === 'COMPLETED') {
+      return res.status(409).json({ success: false, error: `Cannot retry vendor assignment for status ${owned.status}` });
+    }
+
+    const service = createServiceClient();
+    // Clear any outstanding offer and force pickup back into FINDING_VENDOR.
+    // This is safe because dispatcher acceptance is atomic/conditional.
+    await service
+      .from('pickups')
+      .update({
+        status: 'FINDING_VENDOR',
+        assigned_vendor_ref: null,
+        assignment_expires_at: null,
+        cancelled_at: null,
+      })
+      .eq('id', id);
+
+    // Cancel any in-memory timers/state for this pickup before restarting.
+    try {
+      const state = dispatcher?._internal?.dispatchState?.get(id);
+      if (state?.timer) clearTimeout(state.timer);
+      dispatcher?._internal?.dispatchState?.delete(id);
+    } catch {
+      // ignore
+    }
+
+    dispatcher.dispatchPickup(id).catch((e) => console.warn('[DISPATCH] dispatch_error', e));
+    return res.json({ success: true, pickupId: id, status: 'FINDING_VENDOR' });
+  } catch (e) {
+    console.error('find-vendor failed', e);
+    return res.status(500).json({ success: false, error: 'Could not restart vendor dispatch' });
+  }
+});
+
+/**
+ * POST /api/pickups/:id/cancel
+ * Soft-delete for customers: marks the pickup CANCELLED and clears any outstanding offer.
+ */
+router.post('/:id/cancel', async (req, res) => {
+  try {
+    const jwt = getBearerToken(req);
+    if (!jwt) return res.status(401).json({ success: false, error: 'Missing Authorization Bearer token' });
+
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ success: false, error: 'id is required' });
+
+    const anon = createAnonClientWithJwt(jwt);
+    const { data: owned, error: ownErr } = await anon.from('pickups').select('id,status').eq('id', id).maybeSingle();
+    if (ownErr) return res.status(400).json({ success: false, error: ownErr.message || 'Could not verify pickup' });
+    if (!owned) return res.status(404).json({ success: false, error: 'pickup not found' });
+
+    const status = String(owned.status || '').toUpperCase();
+    if (status === 'COMPLETED') {
+      return res.status(409).json({ success: false, error: 'Completed pickups cannot be cancelled' });
+    }
+
+    const service = createServiceClient();
+    const now = new Date().toISOString();
+    await service
+      .from('pickups')
+      .update({
+        status: 'CANCELLED',
+        cancelled_at: now,
+        assigned_vendor_ref: null,
+        assignment_expires_at: null,
+      })
+      .eq('id', id);
+
+    // Stop any in-memory timers/state for this pickup.
+    try {
+      const state = dispatcher?._internal?.dispatchState?.get(id);
+      if (state?.timer) clearTimeout(state.timer);
+      dispatcher?._internal?.dispatchState?.delete(id);
+    } catch {
+      // ignore
+    }
+
+    return res.json({ success: true, pickupId: id, status: 'CANCELLED' });
+  } catch (e) {
+    console.error('cancel pickup failed', e);
+    return res.status(500).json({ success: false, error: 'Could not cancel pickup' });
+  }
+});
 
 /**
  * POST /api/pickups/accepted
@@ -196,8 +291,15 @@ router.post('/accepted', async (req, res) => {
   const sig = verifyVendorSignature(req);
   if (!sig.ok) return res.status(401).json({ success: false, error: sig.error });
 
-  const { pickupId, assignedVendorRef } = req.body || {};
-  if (!pickupId) return res.status(400).json({ success: false, error: 'pickupId is required' });
+  const body = req.body || {};
+  const pickupId = body.pickupId || body.pickup_id || body.request_id || body.requestId;
+  const { assignedVendorRef } = body;
+  if (!pickupId) {
+    return res.status(400).json({
+      success: false,
+      error: 'pickupId is required (accepted keys: pickupId, pickup_id, request_id, requestId)',
+    });
+  }
 
   try {
     const dispatcher = require('../services/dispatcher');
@@ -209,3 +311,10 @@ router.post('/accepted', async (req, res) => {
     return res.status(500).json({ success: false, error: 'Pickup accepted notify failed' });
   }
 });
+
+// After create we attempt dispatching (non-blocking)
+// Note: the RPC above returns the `pickup` row; callers that use this
+// route will receive the created pickup immediately while dispatch runs
+// in the background.
+
+module.exports = router;
